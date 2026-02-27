@@ -5,7 +5,7 @@ import math
 import time
 from flask import Flask, request
 from datetime import datetime, timedelta
-from threading import Thread
+from threading import Thread, Lock
 
 app = Flask(__name__)
 
@@ -14,13 +14,13 @@ GOOGLE_URL = os.environ.get('GOOGLE_SCRIPT_URL')
 VERIFICATION_GROUP = os.environ.get('VERIFICATION_GROUP_ID')
 ADMIN_ID = os.environ.get('ADMIN_CHAT_ID')
 
-# عشان ننظف الألبومات القديمة
 pending_albums = {}
+album_locks = {}  # Lock لكل ألبوم عشان نتجنب race condition
 
 def cleanup_old_albums():
     """نظف الألبومات القديمة (أكتر من 10 دقايق)"""
     while True:
-        time.sleep(300)  # كل 5 دقايق
+        time.sleep(300)
         now = datetime.now()
         to_delete = []
         
@@ -29,10 +29,12 @@ def cleanup_old_albums():
                 to_delete.append(album_id)
         
         for album_id in to_delete:
-            del pending_albums[album_id]
+            if album_id in pending_albums:
+                del pending_albums[album_id]
+            if album_id in album_locks:
+                del album_locks[album_id]
             print(f"🧹 Cleaned up old album: {album_id}")
 
-# ابدأ الـ cleanup thread
 Thread(target=cleanup_old_albums, daemon=True).start()
 
 def send_message(chat_id, text, reply_to=None, reply_markup=None):
@@ -50,6 +52,21 @@ def send_message(chat_id, text, reply_to=None, reply_markup=None):
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Error: {e}")
+
+def send_photo(chat_id, photo, caption, reply_markup=None):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+    payload = {
+        "chat_id": chat_id,
+        "photo": photo,
+        "caption": caption,
+        "parse_mode": "HTML"
+    }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Error sending photo: {e}")
 
 def send_media_group(chat_id, photos, caption, reply_to=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMediaGroup"
@@ -101,16 +118,15 @@ def parse_caption(text):
     return name, username, None
 
 def calculate_money(total_comments):
-    """كل 100 كومنت = 5 ريال"""
     hundreds = total_comments // 100
     return hundreds * 5
 
-def process_album(media_group_id):
-    """تتنفذ بعد 6 ثواني من أول صورة"""
-    time.sleep(6)
+def process_album_after_delay(media_group_id, delay=8):
+    """تتنفذ بعد delay ثواني من آخر صورة"""
+    time.sleep(delay)
     
     if media_group_id not in pending_albums:
-        print(f"⚠️ Album {media_group_id} not found")
+        print(f"⚠️ Album {media_group_id} not found after {delay}s wait")
         return
     
     album = pending_albums[media_group_id]
@@ -120,9 +136,12 @@ def process_album(media_group_id):
     original_message_id = album["message_id"]
     
     count = len(photos)
-    print(f"🔄 Processing {media_group_id}: {count} photos")
+    print(f"🔄 Processing {media_group_id}: {count} photos collected after {delay}s wait")
     
+    # نمسح الألبوم من الذاكرة
     del pending_albums[media_group_id]
+    if media_group_id in album_locks:
+        del album_locks[media_group_id]
     
     clean_caption = caption.replace('#كومنت', '').strip()
     name, username, error = parse_caption(clean_caption)
@@ -146,6 +165,13 @@ def process_album(media_group_id):
     
     # بعت الألبوم كامل
     result = send_media_group(VERIFICATION_GROUP, photos, caption_verification)
+    
+    if not result or not result.get('ok'):
+        print(f"❌ Failed to send media group, trying individual photos")
+        # لو فشل، بعت الصور واحدة واحدة
+        for i, photo in enumerate(photos):
+            cap = caption_verification if i == 0 else None
+            send_photo(VERIFICATION_GROUP, photo, cap)
     
     # keyboard
     keyboard = {
@@ -191,24 +217,33 @@ def webhook():
             return 'OK'
         
         media_group_id = msg['media_group_id']
-        photo = msg['photo'][-1]['file_id']
+        photo = msg['photo'][-1]['file_id']  # أعلى جودة
         
-        # لو ألبوم جديد، ابدأ Thread
+        # لو ألبوم جديد، نبدأ نجمع
         if media_group_id not in pending_albums:
-            print(f"🆕 New album: {media_group_id}")
+            print(f"🆕 New album started: {media_group_id}")
             pending_albums[media_group_id] = {
                 "photos": [],
                 "caption": caption,
                 "from_chat": chat_id,
                 "message_id": message_id,
-                "created_at": datetime.now()
+                "created_at": datetime.now(),
+                "timer_thread": None
             }
-            Thread(target=process_album, args=(media_group_id,)).start()
+            album_locks[media_group_id] = Lock()
+            
+            # ✅ ابدأ Thread يستنى 8 ثواني من الآن (مش فوراً)
+            t = Thread(target=process_album_after_delay, args=(media_group_id, 8))
+            pending_albums[media_group_id]["timer_thread"] = t
+            t.start()
+            print(f"⏱️ Started 8s timer for {media_group_id}")
         
-        # ضيف الصورة
-        pending_albums[media_group_id]["photos"].append(photo)
-        current = len(pending_albums[media_group_id]["photos"])
-        print(f"📸 Added to {media_group_id}: {current} photos")
+        # نضيف الصورة للألبوم
+        with album_locks.get(media_group_id, Lock()):
+            if media_group_id in pending_albums:
+                pending_albums[media_group_id]["photos"].append(photo)
+                current = len(pending_albums[media_group_id]["photos"])
+                print(f"📸 Added photo to {media_group_id}: total {current} photos")
         
         return 'OK'
     
@@ -263,7 +298,6 @@ def handle_callback(query):
         
         money = calculate_money(count)
         
-        # سجل كل صورة ككومنت منفصل
         for i in range(count):
             try:
                 requests.post(GOOGLE_URL, json={
