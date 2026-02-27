@@ -15,25 +15,25 @@ VERIFICATION_GROUP = os.environ.get('VERIFICATION_GROUP_ID')
 ADMIN_ID = os.environ.get('ADMIN_CHAT_ID')
 
 pending_albums = {}
-album_locks = {}  # Lock لكل ألبوم عشان نتجنب race condition
+album_timers = {}  # نخلي كل ألبوم يمدد التايمر
+global_lock = Lock()  # Lock واحد لكل حاجة
 
 def cleanup_old_albums():
-    """نظف الألبومات القديمة (أكتر من 10 دقايق)"""
     while True:
         time.sleep(300)
         now = datetime.now()
-        to_delete = []
-        
-        for album_id, album in list(pending_albums.items()):
-            if now - album.get("created_at", now) > timedelta(minutes=10):
-                to_delete.append(album_id)
-        
-        for album_id in to_delete:
-            if album_id in pending_albums:
+        with global_lock:
+            to_delete = []
+            for album_id, album in list(pending_albums.items()):
+                if now - album.get("created_at", now) > timedelta(minutes=10):
+                    to_delete.append(album_id)
+            
+            for album_id in to_delete:
                 del pending_albums[album_id]
-            if album_id in album_locks:
-                del album_locks[album_id]
-            print(f"🧹 Cleaned up old album: {album_id}")
+                if album_id in album_timers:
+                    album_timers[album_id].cancel()
+                    del album_timers[album_id]
+                print(f"🧹 Cleaned up: {album_id}")
 
 Thread(target=cleanup_old_albums, daemon=True).start()
 
@@ -66,7 +66,7 @@ def send_photo(chat_id, photo, caption, reply_markup=None):
     try:
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Error sending photo: {e}")
+        print(f"Error: {e}")
 
 def send_media_group(chat_id, photos, caption, reply_to=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMediaGroup"
@@ -94,7 +94,7 @@ def send_media_group(chat_id, photos, caption, reply_to=None):
         print(f"✅ Media group: {len(photos)} photos, status: {response.status_code}")
         return response.json()
     except Exception as e:
-        print(f"❌ Error media group: {e}")
+        print(f"❌ Error: {e}")
         return None
 
 def parse_caption(text):
@@ -113,7 +113,7 @@ def parse_caption(text):
             name = line
     
     if not name or not username:
-        return None, None, "❌ اكتب بالشكل ده:\n\nعزام\n@username\n#كومنت"
+        return None, None, "❌ اكتب:\n\nعزام\n@username\n#كومنت"
     
     return name, username, None
 
@@ -121,28 +121,28 @@ def calculate_money(total_comments):
     hundreds = total_comments // 100
     return hundreds * 5
 
-def process_album_after_delay(media_group_id, delay=8):
-    """تتنفذ بعد delay ثواني من آخر صورة"""
-    time.sleep(delay)
+def process_album_final(media_group_id):
+    """تتنفذ بعد ما نتأكد إن مفيش صور جديدة"""
+    with global_lock:
+        if media_group_id not in pending_albums:
+            print(f"⚠️ Album {media_group_id} gone")
+            return
+        
+        album = pending_albums[media_group_id]
+        photos = album["photos"]
+        caption = album["caption"]
+        from_chat = album["from_chat"]
+        original_message_id = album["message_id"]
+        
+        count = len(photos)
+        print(f"🔄 FINAL Processing {media_group_id}: {count} photos")
+        
+        # نمسح من الذاكرة
+        del pending_albums[media_group_id]
+        if media_group_id in album_timers:
+            del album_timers[media_group_id]
     
-    if media_group_id not in pending_albums:
-        print(f"⚠️ Album {media_group_id} not found after {delay}s wait")
-        return
-    
-    album = pending_albums[media_group_id]
-    photos = album["photos"]
-    caption = album["caption"]
-    from_chat = album["from_chat"]
-    original_message_id = album["message_id"]
-    
-    count = len(photos)
-    print(f"🔄 Processing {media_group_id}: {count} photos collected after {delay}s wait")
-    
-    # نمسح الألبوم من الذاكرة
-    del pending_albums[media_group_id]
-    if media_group_id in album_locks:
-        del album_locks[media_group_id]
-    
+    # بره الـ Lock عشان ما نبقاش نمسك الدنيا
     clean_caption = caption.replace('#كومنت', '').strip()
     name, username, error = parse_caption(clean_caption)
     
@@ -163,17 +163,14 @@ def process_album_after_delay(media_group_id, delay=8):
         f"⚠️ كل 100 كومنت = 5 ريال"
     )
     
-    # بعت الألبوم كامل
     result = send_media_group(VERIFICATION_GROUP, photos, caption_verification)
     
     if not result or not result.get('ok'):
-        print(f"❌ Failed to send media group, trying individual photos")
-        # لو فشل، بعت الصور واحدة واحدة
+        print(f"❌ Media group failed, sending individually")
         for i, photo in enumerate(photos):
             cap = caption_verification if i == 0 else None
             send_photo(VERIFICATION_GROUP, photo, cap)
     
-    # keyboard
     keyboard = {
         "inline_keyboard": [[
             {"text": f"✅ تأكيد ({count})", "callback_data": f"verify_multi|{from_chat}|{name}|{username}|{count}|{current_date}|{original_message_id}"},
@@ -185,12 +182,11 @@ def process_album_after_delay(media_group_id, delay=8):
         f"☝️ {count} كومنتات | 👤 {name} | 🔹 {username}", 
         reply_markup=keyboard)
     
-    # Reply للشخص
     send_message(from_chat, 
-        f"⏳ تم إرسال {count} كومنتات للتأكيد!\n\n"
+        f"⏳ تم إرسال {count} كومنتات!\n\n"
         f"👤 {name} | {username}\n"
         f"📊 {count} كومنت\n"
-        f"💰 {money} ريال (كل 100 = 5 ريال)",
+        f"💰 {money} ريال",
         reply_to=original_message_id)
 
 @app.route('/webhook', methods=['POST'])
@@ -217,33 +213,39 @@ def webhook():
             return 'OK'
         
         media_group_id = msg['media_group_id']
-        photo = msg['photo'][-1]['file_id']  # أعلى جودة
+        photo = msg['photo'][-1]['file_id']
         
-        # لو ألبوم جديد، نبدأ نجمع
-        if media_group_id not in pending_albums:
-            print(f"🆕 New album started: {media_group_id}")
-            pending_albums[media_group_id] = {
-                "photos": [],
-                "caption": caption,
-                "from_chat": chat_id,
-                "message_id": message_id,
-                "created_at": datetime.now(),
-                "timer_thread": None
-            }
-            album_locks[media_group_id] = Lock()
+        with global_lock:
+            # لو ألبوم جديد
+            if media_group_id not in pending_albums:
+                print(f"🆕 NEW Album: {media_group_id}")
+                pending_albums[media_group_id] = {
+                    "photos": [],
+                    "caption": caption,
+                    "from_chat": chat_id,
+                    "message_id": message_id,
+                    "created_at": datetime.now()
+                }
             
-            # ✅ ابدأ Thread يستنى 8 ثواني من الآن (مش فوراً)
-            t = Thread(target=process_album_after_delay, args=(media_group_id, 8))
-            pending_albums[media_group_id]["timer_thread"] = t
+            # نضيف الصورة
+            pending_albums[media_group_id]["photos"].append(photo)
+            current_count = len(pending_albums[media_group_id]["photos"])
+            print(f"📸 Album {media_group_id}: {current_count} photos")
+            
+            # نلغي التايمر القديم لو موجود
+            if media_group_id in album_timers:
+                album_timers[media_group_id].cancel()
+                print(f"⏹️ Cancelled old timer for {media_group_id}")
+            
+            # نعمل تايمر جديد 10 ثواني من دلوقتي
+            def start_timer():
+                time.sleep(10)
+                process_album_final(media_group_id)
+            
+            t = Thread(target=start_timer)
+            album_timers[media_group_id] = t
             t.start()
-            print(f"⏱️ Started 8s timer for {media_group_id}")
-        
-        # نضيف الصورة للألبوم
-        with album_locks.get(media_group_id, Lock()):
-            if media_group_id in pending_albums:
-                pending_albums[media_group_id]["photos"].append(photo)
-                current = len(pending_albums[media_group_id]["photos"])
-                print(f"📸 Added photo to {media_group_id}: total {current} photos")
+            print(f"⏱️ Started NEW 10s timer for {media_group_id}")
         
         return 'OK'
     
@@ -276,7 +278,7 @@ def webhook():
         }
         
         send_photo(VERIFICATION_GROUP, photo, caption_verification, reply_markup=keyboard)
-        send_message(chat_id, "⏳ تم إرسال الكومنت للتأكيد!", reply_to=message_id)
+        send_message(chat_id, "⏳ تم إرسال الكومنت!", reply_to=message_id)
         return 'OK'
     
     return 'OK'
@@ -311,14 +313,10 @@ def handle_callback(query):
                     'amount': 0
                 }, timeout=10)
             except Exception as e:
-                print(f"❌ Error saving comment {i+1}: {e}")
-        
-        print(f"✅ Saved {count} comments for {name}")
+                print(f"❌ Error: {e}")
         
         send_message(user_chat_id, 
-            f"🎉 تم تأكيد {count} كومنتات!\n"
-            f"👤 {name} | {username}\n"
-            f"💰 {money} ريال (كل 100 = 5 ريال)",
+            f"🎉 تم تأكيد {count} كومنتات!\n💰 {money} ريال",
             reply_to=original_message_id)
         
     elif data.startswith('verify'):
@@ -343,21 +341,18 @@ def handle_callback(query):
         except Exception as e:
             print(f"❌ Error: {e}")
         
-        send_message(user_chat_id, 
-            f"🎉 تم تأكيد الكومنت!\n"
-            f"👤 {name} | {username}",
-            reply_to=original_message_id)
+        send_message(user_chat_id, "🎉 تم تأكيد الكومنت!", reply_to=original_message_id)
         
     elif data.startswith('reject'):
         parts = data.split('|')
         user_chat_id = parts[1]
         original_message_id = parts[2] if len(parts) > 2 else None
         
-        send_message(user_chat_id, "❌ تم رفض الكومنتات.", reply_to=original_message_id)
+        send_message(user_chat_id, "❌ تم رفض.", reply_to=original_message_id)
 
 @app.route('/')
 def home():
-    return "Daem Bot is running! 💰"
+    return "Bot Running!"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
