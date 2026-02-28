@@ -14,7 +14,6 @@ GOOGLE_URL = os.environ.get('GOOGLE_SCRIPT_URL')
 VERIFICATION_GROUP = os.environ.get('VERIFICATION_GROUP_ID')
 ADMIN_ID = os.environ.get('ADMIN_CHAT_ID')
 
-# Lock عشان نتجنب التكرار
 global_lock = Lock()
 
 def send_message(chat_id, text, reply_to=None, reply_markup=None):
@@ -29,9 +28,11 @@ def send_message(chat_id, text, reply_to=None, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
+        return r.json()
     except Exception as e:
         print(f"Error: {e}")
+        return None
 
 def send_photo(chat_id, photo, caption, reply_markup=None, reply_to=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
@@ -46,10 +47,13 @@ def send_photo(chat_id, photo, caption, reply_markup=None, reply_to=None):
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json()
+        r = requests.post(url, json=payload, timeout=10)
+        result = r.json()
+        if not result.get('ok'):
+            print(f"❌ send_photo error: {result}")
+        return result
     except Exception as e:
-        print(f"Error sending photo: {e}")
+        print(f"❌ Exception send_photo: {e}")
         return None
 
 def parse_caption(text):
@@ -99,11 +103,8 @@ def webhook():
         if '#كومنت' not in caption:
             return 'OK'
         
-        # نجيب كل الصور (كل الجودات، نختار أعلى جودة لكل صورة)
-        photos = msg['photo']  # ده list بكل جودات الصورة الواحدة
-        best_photo = photos[-1]['file_id']  # أعلى جودة
-        
-        media_group_id = msg['media_group_id']
+        photos = msg['photo']
+        best_photo = photos[-1]['file_id']
         
         clean_caption = caption.replace('#كومنت', '').strip()
         name, username, error = parse_caption(clean_caption)
@@ -114,39 +115,50 @@ def webhook():
         
         current_date = datetime.now().strftime("%Y-%m-%d")
         
-        # ✅ نبعت الصورة فوراً لجروب التأكيد
+        # ✅ callback_data مختصر (مش أكتر من 64 حرف)
+        # نستخدم أول 10 حروف من الاسم واليوزر عشان نختصر
+        short_name = name[:10] if len(name) > 10 else name
+        short_user = username[:15] if len(username) > 15 else username
+        
+        callback_data = f"v|{chat_id}|{short_name}|{short_user}|{current_date}|{message_id}"
+        
+        # لو طويل، نختصر أكتر
+        if len(callback_data) > 60:
+            callback_data = f"v|{chat_id}|{message_id}"
+        
         caption_verification = (
-            f"📝 <b>كومنت جديد</b> (جزء من ألبوم)\n\n"
+            f"📝 <b>كومنت جديد</b>\n\n"
             f"👤 <b>الاسم:</b> {name}\n"
             f"🔹 <b>اليوزر:</b> {username}\n"
-            f"📅 <b>التاريخ:</b> {current_date}\n"
-            f"🆔 <b>ألبوم:</b> {media_group_id}"
+            f"📅 <b>التاريخ:</b> {current_date}"
         )
         
         keyboard = {
             "inline_keyboard": [[
-                {"text": "✅ تأكيد", "callback_data": f"verify|{chat_id}|{name}|{username}|{current_date}|1|{message_id}|{media_group_id}"},
-                {"text": "❌ رفض", "callback_data": f"reject|{chat_id}|{message_id}"}
+                {"text": "✅ تأكيد", "callback_data": callback_data},
+                {"text": "❌ رفض", "callback_data": f"r|{chat_id}|{message_id}"}
             ]]
         }
         
-        # نبعت الصورة
+        print(f"📤 Sending photo: {name} | callback: {callback_data[:30]}...")
+        
         result = send_photo(VERIFICATION_GROUP, best_photo, caption_verification, reply_markup=keyboard)
         
         if result and result.get('ok'):
-            print(f"✅ Sent photo to verification: {name} | Album: {media_group_id}")
+            print(f"✅ Sent successfully")
+            send_message(chat_id, 
+                f"⏳ تم إرسال الكومنت للتأكيد!\n"
+                f"👤 {name} | {username}",
+                reply_to=message_id)
         else:
-            print(f"❌ Failed to send photo: {result}")
-        
-        # نرد على المستخدم
-        send_message(chat_id, 
-            f"⏳ تم إرسال الكومنت للتأكيد!\n"
-            f"👤 {name} | {username}",
-            reply_to=message_id)
+            print(f"❌ Failed: {result}")
+            # لو فشل بسبب الكيبورد، نبعت من غير كيبورد
+            send_photo(VERIFICATION_GROUP, best_photo, caption_verification)
+            send_message(VERIFICATION_GROUP, f"⚠️ تأكيد يدوي: {name} | {username}")
         
         return 'OK'
     
-    # ========== صورة واحدة (بدون media_group_id) ==========
+    # ========== صورة واحدة ==========
     elif 'photo' in msg and '#كومنت' in (msg.get('caption', '')):
         photos = msg['photo']
         best_photo = photos[-1]['file_id']
@@ -160,23 +172,29 @@ def webhook():
         
         current_date = datetime.now().strftime("%Y-%m-%d")
         
+        short_name = name[:10] if len(name) > 10 else name
+        short_user = username[:15] if len(username) > 15 else username
+        
+        callback_data = f"v|{chat_id}|{short_name}|{short_user}|{current_date}|{message_id}"
+        if len(callback_data) > 60:
+            callback_data = f"v|{chat_id}|{message_id}"
+        
         caption_verification = (
             f"📝 <b>كومنت جديد</b>\n\n"
             f"👤 <b>الاسم:</b> {name}\n"
             f"🔹 <b>اليوزر:</b> {username}\n"
-            f"📅 <b>التاريخ:</b> {current_date}\n"
-            f"📊 1 كومنت"
+            f"📅 <b>التاريخ:</b> {current_date}"
         )
         
         keyboard = {
             "inline_keyboard": [[
-                {"text": "✅ تأكيد", "callback_data": f"verify|{chat_id}|{name}|{username}|{current_date}|1|{message_id}|single"},
-                {"text": "❌ رفض", "callback_data": f"reject|{chat_id}|{message_id}"}
+                {"text": "✅ تأكيد", "callback_data": callback_data},
+                {"text": "❌ رفض", "callback_data": f"r|{chat_id}|{message_id}"}
             ]]
         }
         
         send_photo(VERIFICATION_GROUP, best_photo, caption_verification, reply_markup=keyboard)
-        send_message(chat_id, "⏳ تم إرسال الكومنت للتأكيد!", reply_to=message_id)
+        send_message(chat_id, "⏳ تم إرسال الكومنت!", reply_to=message_id)
         return 'OK'
     
     return 'OK'
@@ -190,58 +208,70 @@ def handle_callback(query):
     parts = data.split('|')
     action = parts[0]
     
-    if action == 'verify':
+    if action == 'v':  # verify
         user_chat_id = parts[1]
-        name = parts[2]
-        username = parts[3]
-        date = parts[4]
-        count = int(parts[5])
-        original_message_id = parts[6]
-        album_id = parts[7] if len(parts) > 7 else 'single'
         
-        money = calculate_money(count)
+        # لو البيانات كاملة
+        if len(parts) >= 5:
+            name = parts[2]
+            username = parts[3]
+            date = parts[4]
+            original_message_id = parts[5] if len(parts) > 5 else None
+        else:
+            # لو مختصر، نجيب من الكابشن
+            caption = message.get('caption', '')
+            name = "Unknown"
+            username = "Unknown"
+            date = datetime.now().strftime("%Y-%m-%d")
+            original_message_id = parts[2] if len(parts) > 2 else None
+            
+            # نحاول نجيب الاسم من الكابشن
+            for line in caption.split('\n'):
+                if 'الاسم:' in line:
+                    name = line.split(':', 1)[1].strip()
+                elif 'اليوزر:' in line:
+                    username = line.split(':', 1)[1].strip()
         
-        # ✅ نسجل في Google Sheets
+        money = calculate_money(1)
+        
         try:
-            response = requests.post(GOOGLE_URL, json={
+            requests.post(GOOGLE_URL, json={
                 'action': 'add_comment',
                 'name': name,
                 'username': username,
                 'date': date,
-                'count': count,
+                'count': 1,
                 'status': '✅ تم التأكيد',
                 'verifiedBy': verifier_name,
-                'amount': 0,
-                'album_id': album_id
+                'amount': 0
             }, timeout=10)
-            print(f"✅ Saved to Sheets: {name} | {count} | Album: {album_id}")
+            print(f"✅ Saved: {name}")
         except Exception as e:
-            print(f"❌ Error saving: {e}")
+            print(f"❌ Error: {e}")
         
-        # نرد على المستخدم
         send_message(user_chat_id, 
             f"🎉 تم تأكيد الكومنت!\n"
             f"👤 {name} | {username}\n"
             f"💰 {money} ريال",
             reply_to=original_message_id)
         
-        # نعدل الرسالة الأصلية في جروب التأكيد
-        new_text = (
+        # نعدل الرسالة
+        new_caption = (
             f"✅ <b>تم التأكيد بواسطة {verifier_name}</b>\n\n"
-            f"👤 {name} | {username}\n"
-            f"📅 {date}"
+            f"👤 {name}\n"
+            f"🔹 {username}"
         )
-        send_message(chat_id, new_text, reply_to=message['message_id'])
+        # نبعت صورة جديدة (مش نقدر نعدل الكابشن)
+        send_message(chat_id, new_caption, reply_to=message['message_id'])
         
-    elif action == 'reject':
+    elif action == 'r':  # reject
         user_chat_id = parts[1]
         original_message_id = parts[2] if len(parts) > 2 else None
-        
-        send_message(user_chat_id, "❌ تم رفض الكومنت.", reply_to=original_message_id)
+        send_message(user_chat_id, "❌ تم رفض.", reply_to=original_message_id)
 
 @app.route('/')
 def home():
-    return "Daem Bot Running! 💰"
+    return "Bot Running!"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
