@@ -50,7 +50,8 @@ def send_message(chat_id, text, reply_to=None):
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "HTML"
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
     if reply_to:
         payload["reply_to_message_id"] = reply_to
@@ -59,40 +60,63 @@ def send_message(chat_id, text, reply_to=None):
     except:
         pass
 
-def get_chat_members(chat_id):
-    """نجيب كل الأعضاء في الجروب"""
+def get_all_members(chat_id):
+    """✅ نجيب كل الأعضاء (مش الـ Admins بس)"""
+    members = []
+    
+    # ✅ نجرب getChatMemberCount الأول
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/getChatMemberCount"
+        r = requests.post(url, json={"chat_id": chat_id}, timeout=10)
+        result = r.json()
+        if result.get('ok'):
+            log(f"👥 Chat has {result['result']} members")
+    except:
+        pass
+    
+    # ✅ نجيب الـ Admins (الطريقة الوحيدة المتاحة للبوتات)
     url = f"https://api.telegram.org/bot{TOKEN}/getChatAdministrators"
     try:
         r = requests.post(url, json={"chat_id": chat_id}, timeout=10)
         result = r.json()
         if result.get('ok'):
-            members = []
             for member in result.get('result', []):
                 user = member.get('user', {})
                 if not user.get('is_bot'):
                     username = user.get('username')
+                    user_id = user.get('id')
+                    first_name = user.get('first_name', 'User')
+                    
                     if username:
                         members.append(f"@{username}")
                     else:
-                        members.append(f"[{user.get('first_name', 'User')}](tg://user?id={user['id']})")
+                        # ✅ نستخدم mention بالـ ID (أفضل من اللينك)
+                        members.append(f'<a href="tg://user?id={user_id}">{first_name}</a>')
+            
+            log(f"✅ Found {len(members)} members")
             return members
+        else:
+            log(f"❌ getChatAdministrators failed: {result}")
     except Exception as e:
-        log(f"❌ Error getting members: {e}")
+        log(f"❌ Error: {e}")
+    
     return []
 
 def mention_all(chat_id):
-    """نمنشن كل الناس (بس المنشن، من غير أي نص)"""
-    members = get_chat_members(chat_id)
+    """✅ نمنشن كل الناس"""
+    members = get_all_members(chat_id)
+    
     if not members:
-        send_message(chat_id, "❌ مقدرش أجيب الأعضاء. لازم أكون Admin.")
+        send_message(chat_id, "❌ مقدرش أجيب الأعضاء.\n\nلازم:\n1. أكون Admin في الجروب\n2. يكون عندي صلاحية 'Add Members'")
         return
     
-    batch_size = 5
+    # ✅ نبعت المنشن في batches
+    batch_size = 4  # أقل شوية عشان ميتبنش
     for i in range(0, len(members), batch_size):
         batch = members[i:i+batch_size]
         mention_text = " ".join(batch)
         send_message(chat_id, mention_text)
-        time.sleep(0.5)
+        time.sleep(0.3)
 
 def parse_caption_multi(caption):
     """نParse الكابشن ونجيب الاسم واليوزرات"""
@@ -174,19 +198,22 @@ def webhook():
                         "photos_count": 1
                     }
                     
+                    # ✅ نحدد اليوزر (حتى لو مفيش يوزرات، هنستخدم loop)
                     current_user = users[0] if users else None
                     
                 elif media_group_id in album_captions:
                     # صورة تانية
                     album = album_captions[media_group_id]
                     album["photos_count"] += 1
-                    idx = album["photos_count"] - 1
+                    idx = album["photos_count"] - 1  # 0, 1, 2, 3, 4, 5...
                     
                     users = album["users"]
-                    if idx < len(users):
-                        current_user = users[idx]
+                    
+                    # ✅ LOOP: لو اليوزرات خلصت، نرجع من الأول
+                    if users:
+                        current_user = users[idx % len(users)]  # ✅ ده الحل!
                     else:
-                        current_user = None  # مفيش يوزر كافي
+                        current_user = None
                     
                     log(f"📸 #{album['photos_count']} | User: {current_user or 'None'}")
                     name = album["name"]
@@ -202,28 +229,22 @@ def webhook():
         
         photos = msg['photo']
         best_photo = photos[-1]['file_id']
-        current_date = datetime.now().strftime("%Y-%m-%d" )
+        current_date = datetime.now().strftime("%Y-%m-%d")
         
-        # ✅ نعمل callback_data للزرار (لليوزر أو بدون يوزر)
+        # ✅ نعمل callback_data
         short_name = name[:8] if len(name) > 8 else name
         
         if current_user:
-            # في يوزر
             short_user = current_user[:10] if len(current_user) > 10 else current_user
             cb_verify = f"v|{chat_id}|{short_name}|{short_user}|{current_date}|{message_id}"
-            display_user = current_user
         else:
-            # ✅ مفيش يوزر - نستخدم "nouser" أو نتركه فاضي
             cb_verify = f"v|{chat_id}|{short_name}|nouser|{current_date}|{message_id}"
-            display_user = "⚠️ غير محدد"
         
-        # نختصر لو طويل
         if len(cb_verify) > 60:
             cb_verify = f"v|{chat_id}|{message_id}"
         
         cb_reject = f"r|{chat_id}|{message_id}"
         
-        # ✅ زرار التأكيد والرفض لكل الصور (مع يوزر أو بدون)
         keyboard = {
             "inline_keyboard": [[
                 {"text": "✅ تأكيد", "callback_data": cb_verify},
@@ -231,6 +252,7 @@ def webhook():
             ]]
         }
         
+        # ✅ الكابشن
         if current_user:
             verify_caption = (
                 f"📝 كومنت جديد\n\n"
@@ -239,9 +261,8 @@ def webhook():
                 f"📅 التاريخ: {current_date}"
             )
         else:
-            # ✅ صورة بدون يوزر - بس مع زرار برضه
             verify_caption = (
-                f"📝 كومنت جديد (بدون يوزر)\n\n"
+                f"📝 كومنت جديد\n\n"
                 f"👤 الاسم: {name}\n"
                 f"⚠️ اليوزر: غير محدد\n"
                 f"📅 التاريخ: {current_date}"
@@ -250,7 +271,7 @@ def webhook():
         if media_group_id:
             total_users = len(album_captions[media_group_id].get('users', []))
             current_count = album_captions[media_group_id]['photos_count']
-            verify_caption += f"\n🆔 صورة {current_count}/{total_users if total_users >= current_count else current_count}"
+            verify_caption += f"\n🆔 صورة {current_count}"
         
         success, result = send_photo_with_keyboard(VERIFICATION_GROUP, best_photo, verify_caption, keyboard)
         
@@ -285,7 +306,7 @@ def handle_callback(query):
             name = parts[2]
             username = parts[3]
             if username == "nouser":
-                username = "⚠️ غير محدد"  # ✅ نرجع النص الأصلي
+                username = "⚠️ غير محدد"
             date = parts[4]
             original_msg_id = int(parts[5]) if parts[5].isdigit() else None
         else:
@@ -303,7 +324,6 @@ def handle_callback(query):
         
         money = calculate_money(1)
         
-        # ✅ نسجل في Google Sheets (حتى لو مفيش يوزر)
         try:
             requests.post(GOOGLE_URL, json={
                 'action': 'add_comment',
@@ -364,4 +384,3 @@ def home():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
-
