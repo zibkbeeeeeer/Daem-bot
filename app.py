@@ -17,6 +17,9 @@ VERIFICATION_GROUP = os.environ.get('VERIFICATION_GROUP_ID')
 album_captions = {}
 album_lock = Lock()
 
+# ✅ نخزن كل الأعضاء اللي شفناهم (cache)
+group_members = {}  # {chat_id: {user_id: {"username": "...", "name": "..."}}}
+
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
@@ -60,63 +63,70 @@ def send_message(chat_id, text, reply_to=None):
     except:
         pass
 
-def get_all_members(chat_id):
-    """✅ نجيب كل الأعضاء (مش الـ Admins بس)"""
-    members = []
-    
-    # ✅ نجرب getChatMemberCount الأول
-    try:
-        url = f"https://api.telegram.org/bot{TOKEN}/getChatMemberCount"
-        r = requests.post(url, json={"chat_id": chat_id}, timeout=10)
-        result = r.json()
-        if result.get('ok'):
-            log(f"👥 Chat has {result['result']} members")
-    except:
-        pass
-    
-    # ✅ نجيب الـ Admins (الطريقة الوحيدة المتاحة للبوتات)
-    url = f"https://api.telegram.org/bot{TOKEN}/getChatAdministrators"
-    try:
-        r = requests.post(url, json={"chat_id": chat_id}, timeout=10)
-        result = r.json()
-        if result.get('ok'):
-            for member in result.get('result', []):
-                user = member.get('user', {})
-                if not user.get('is_bot'):
-                    username = user.get('username')
-                    user_id = user.get('id')
-                    first_name = user.get('first_name', 'User')
-                    
-                    if username:
-                        members.append(f"@{username}")
-                    else:
-                        # ✅ نستخدم mention بالـ ID (أفضل من اللينك)
-                        members.append(f'<a href="tg://user?id={user_id}">{first_name}</a>')
-            
-            log(f"✅ Found {len(members)} members")
-            return members
-        else:
-            log(f"❌ getChatAdministrators failed: {result}")
-    except Exception as e:
-        log(f"❌ Error: {e}")
-    
-    return []
-
 def mention_all(chat_id):
-    """✅ نمنشن كل الناس"""
-    members = get_all_members(chat_id)
+    """✅ نمنشن كل الأعضاء اللي نعرفهم (من الـ cache)"""
+    members = group_members.get(chat_id, {})
     
     if not members:
-        send_message(chat_id, "❌ مقدرش أجيب الأعضاء.\n\nلازم:\n1. أكون Admin في الجروب\n2. يكون عندي صلاحية 'Add Members'")
+        # ✅ لو مفيش cache، نجيب الـ Admins على الأقل
+        url = f"https://api.telegram.org/bot{TOKEN}/getChatAdministrators"
+        try:
+            r = requests.post(url, json={"chat_id": chat_id}, timeout=10)
+            result = r.json()
+            if result.get('ok'):
+                for member in result.get('result', []):
+                    user = member.get('user', {})
+                    if not user.get('is_bot'):
+                        user_id = user.get('id')
+                        username = user.get('username')
+                        first_name = user.get('first_name', 'User')
+                        
+                        # نخزن في cache
+                        if chat_id not in group_members:
+                            group_members[chat_id] = {}
+                        group_members[chat_id][user_id] = {
+                            "username": username,
+                            "name": first_name
+                        }
+                
+                members = group_members.get(chat_id, {})
+        except Exception as e:
+            log(f"❌ Error: {e}")
+    
+    if not members:
+        send_message(chat_id, "❌ مفيش أعضاء مخزنين.\n\nالبوت لسه بيجمع الأعضاء. جرب تاني بعد شوية.")
         return
     
-    # ✅ نبعت المنشن في batches
-    batch_size = 4  # أقل شوية عشان ميتبنش
-    for i in range(0, len(members), batch_size):
-        batch = members[i:i+batch_size]
+    # ✅ نبعت المنشن
+    mentions = []
+    for user_id, data in members.items():
+        username = data.get("username")
+        name = data.get("name", "User")
+        
+        if username:
+            mentions.append(f"@{username}")
+        else:
+            mentions.append(f'<a href="tg://user?id={user_id}">{name}</a>')
+    
+    # نبعت في batches
+    batch_size = 4
+    for i in range(0, len(mentions), batch_size):
+        batch = mentions[i:i+batch_size]
         mention_text = " ".join(batch)
         send_message(chat_id, mention_text)
         time.sleep(0.3)
+
+def store_member(chat_id, user):
+    """✅ نخزن العضو لما يبعت رسالة"""
+    if chat_id not in group_members:
+        group_members[chat_id] = {}
+    
+    user_id = user.get('id')
+    if user_id and not user.get('is_bot'):
+        group_members[chat_id][user_id] = {
+            "username": user.get('username'),
+            "name": user.get('first_name', 'User')
+        }
 
 def parse_caption_multi(caption):
     """نParse الكابشن ونجيب الاسم واليوزرات"""
@@ -167,6 +177,10 @@ def webhook():
     message_id = msg['message_id']
     text = msg.get('text', '') or ''
     
+    # ✅ نخزن العضو لما يبعت رسالة (عشان نعرفه لما نعمل @all)
+    if 'from' in msg:
+        store_member(chat_id, msg['from'])
+    
     # ✅ @all
     if '@all' in text and msg['chat']['type'] in ['group', 'supergroup']:
         mention_all(chat_id)
@@ -198,20 +212,19 @@ def webhook():
                         "photos_count": 1
                     }
                     
-                    # ✅ نحدد اليوزر (حتى لو مفيش يوزرات، هنستخدم loop)
                     current_user = users[0] if users else None
                     
                 elif media_group_id in album_captions:
                     # صورة تانية
                     album = album_captions[media_group_id]
                     album["photos_count"] += 1
-                    idx = album["photos_count"] - 1  # 0, 1, 2, 3, 4, 5...
+                    idx = album["photos_count"] - 1
                     
                     users = album["users"]
                     
-                    # ✅ LOOP: لو اليوزرات خلصت، نرجع من الأول
+                    # ✅ LOOP لليوزرات
                     if users:
-                        current_user = users[idx % len(users)]  # ✅ ده الحل!
+                        current_user = users[idx % len(users)]
                     else:
                         current_user = None
                     
@@ -231,7 +244,6 @@ def webhook():
         best_photo = photos[-1]['file_id']
         current_date = datetime.now().strftime("%Y-%m-%d")
         
-        # ✅ نعمل callback_data
         short_name = name[:8] if len(name) > 8 else name
         
         if current_user:
@@ -252,7 +264,6 @@ def webhook():
             ]]
         }
         
-        # ✅ الكابشن
         if current_user:
             verify_caption = (
                 f"📝 كومنت جديد\n\n"
@@ -269,7 +280,6 @@ def webhook():
             )
         
         if media_group_id:
-            total_users = len(album_captions[media_group_id].get('users', []))
             current_count = album_captions[media_group_id]['photos_count']
             verify_caption += f"\n🆔 صورة {current_count}"
         
