@@ -74,7 +74,6 @@ def get_chat_members(chat_id):
                     if username:
                         members.append(f"@{username}")
                     else:
-                        # لو مفيش username، نستخدم mention بالـ ID
                         members.append(f"[{user.get('first_name', 'User')}](tg://user?id={user['id']})")
             return members
     except Exception as e:
@@ -88,13 +87,12 @@ def mention_all(chat_id):
         send_message(chat_id, "❌ مقدرش أجيب الأعضاء. لازم أكون Admin.")
         return
     
-    # نبعت المنشن في batches (كل 5 منشنات في رسالة)
     batch_size = 5
     for i in range(0, len(members), batch_size):
         batch = members[i:i+batch_size]
         mention_text = " ".join(batch)
         send_message(chat_id, mention_text)
-        time.sleep(0.5)  # نستنى شوية عشان ميتبنش
+        time.sleep(0.5)
 
 def parse_caption_multi(caption):
     """نParse الكابشن ونجيب الاسم واليوزرات"""
@@ -145,9 +143,9 @@ def webhook():
     message_id = msg['message_id']
     text = msg.get('text', '') or ''
     
-    # ✅ @all - منشن كل الناس (بس المنشن، من غير أي نص)
+    # ✅ @all
     if '@all' in text and msg['chat']['type'] in ['group', 'supergroup']:
-        mention_all(chat_id)  # ✅ بس المنشن، من غير نص
+        mention_all(chat_id)
         return 'OK'
     
     if msg['chat']['type'] == 'private':
@@ -162,7 +160,7 @@ def webhook():
         with album_lock:
             if media_group_id:
                 if has_caption:
-                    # أول صورة - نParse الكابشن ونخزن اليوزرات
+                    # أول صورة
                     name, users = parse_caption_multi(caption)
                     log(f"🆕 Album: {media_group_id} | Name: {name} | Users: {len(users)}")
                     
@@ -173,12 +171,10 @@ def webhook():
                         "from_chat": chat_id,
                         "message_id": message_id,
                         "time": datetime.now(),
-                        "photos_count": 1,
-                        "current_user_index": 0
+                        "photos_count": 1
                     }
                     
                     current_user = users[0] if users else None
-                    has_more_users = len(users) > 0
                     
                 elif media_group_id in album_captions:
                     # صورة تانية
@@ -189,10 +185,8 @@ def webhook():
                     users = album["users"]
                     if idx < len(users):
                         current_user = users[idx]
-                        has_more_users = True
                     else:
-                        current_user = None
-                        has_more_users = False
+                        current_user = None  # مفيش يوزر كافي
                     
                     log(f"📸 #{album['photos_count']} | User: {current_user or 'None'}")
                     name = album["name"]
@@ -205,50 +199,60 @@ def webhook():
                     return 'OK'
                 name, users = parse_caption_multi(caption)
                 current_user = users[0] if users else None
-                has_more_users = len(users) > 0
         
         photos = msg['photo']
         best_photo = photos[-1]['file_id']
-        current_date = datetime.now().strftime("%Y-%m-%d")
+        current_date = datetime.now().strftime("%Y-%m-%d')
         
-        # نجهز الكابشن حسب توفر اليوزر
+        # ✅ نعمل callback_data للزرار (لليوزر أو بدون يوزر)
+        short_name = name[:8] if len(name) > 8 else name
+        
         if current_user:
-            short_name = name[:8] if len(name) > 8 else name
+            # في يوزر
             short_user = current_user[:10] if len(current_user) > 10 else current_user
-            
             cb_verify = f"v|{chat_id}|{short_name}|{short_user}|{current_date}|{message_id}"
-            if len(cb_verify) > 60:
-                cb_verify = f"v|{chat_id}|{message_id}"
-            
-            cb_reject = f"r|{chat_id}|{message_id}"
-            
-            keyboard = {
-                "inline_keyboard": [[
-                    {"text": "✅ تأكيد", "callback_data": cb_verify},
-                    {"text": "❌ رفض", "callback_data": cb_reject}
-                ]]
-            }
-            
+            display_user = current_user
+        else:
+            # ✅ مفيش يوزر - نستخدم "nouser" أو نتركه فاضي
+            cb_verify = f"v|{chat_id}|{short_name}|nouser|{current_date}|{message_id}"
+            display_user = "⚠️ غير محدد"
+        
+        # نختصر لو طويل
+        if len(cb_verify) > 60:
+            cb_verify = f"v|{chat_id}|{message_id}"
+        
+        cb_reject = f"r|{chat_id}|{message_id}"
+        
+        # ✅ زرار التأكيد والرفض لكل الصور (مع يوزر أو بدون)
+        keyboard = {
+            "inline_keyboard": [[
+                {"text": "✅ تأكيد", "callback_data": cb_verify},
+                {"text": "❌ رفض", "callback_data": cb_reject}
+            ]]
+        }
+        
+        if current_user:
             verify_caption = (
                 f"📝 كومنت جديد\n\n"
                 f"👤 الاسم: {name}\n"
                 f"🔹 اليوزر: {current_user}\n"
                 f"📅 التاريخ: {current_date}"
             )
-            if media_group_id:
-                verify_caption += f"\n🆔 صورة {album_captions[media_group_id]['photos_count']}/{len(album_captions[media_group_id].get('users', []))}"
-            
-            success, result = send_photo_with_keyboard(VERIFICATION_GROUP, best_photo, verify_caption, keyboard)
-            
         else:
-            # مفيش يوزر
+            # ✅ صورة بدون يوزر - بس مع زرار برضه
             verify_caption = (
-                f"📝 كومنت (بدون يوزر)\n\n"
+                f"📝 كومنت جديد (بدون يوزر)\n\n"
                 f"👤 الاسم: {name}\n"
-                f"⚠️ مفيش يوزر متاح\n"
+                f"⚠️ اليوزر: غير محدد\n"
                 f"📅 التاريخ: {current_date}"
             )
-            success, result = send_photo_with_keyboard(VERIFICATION_GROUP, best_photo, verify_caption, None)
+        
+        if media_group_id:
+            total_users = len(album_captions[media_group_id].get('users', []))
+            current_count = album_captions[media_group_id]['photos_count']
+            verify_caption += f"\n🆔 صورة {current_count}/{total_users if total_users >= current_count else current_count}"
+        
+        success, result = send_photo_with_keyboard(VERIFICATION_GROUP, best_photo, verify_caption, keyboard)
         
         if success and has_caption:
             count = album_captions[media_group_id]['photos_count'] if media_group_id else 1
@@ -280,6 +284,8 @@ def handle_callback(query):
         if len(parts) >= 6:
             name = parts[2]
             username = parts[3]
+            if username == "nouser":
+                username = "⚠️ غير محدد"  # ✅ نرجع النص الأصلي
             date = parts[4]
             original_msg_id = int(parts[5]) if parts[5].isdigit() else None
         else:
@@ -297,6 +303,7 @@ def handle_callback(query):
         
         money = calculate_money(1)
         
+        # ✅ نسجل في Google Sheets (حتى لو مفيش يوزر)
         try:
             requests.post(GOOGLE_URL, json={
                 'action': 'add_comment',
@@ -308,7 +315,7 @@ def handle_callback(query):
                 'verifiedBy': verifier_name,
                 'amount': 0
             }, timeout=10)
-            log(f"✅ Saved: {name} by {verifier_name}")
+            log(f"✅ Saved: {name} ({username}) by {verifier_name}")
         except Exception as e:
             log(f"❌ Sheets error: {e}")
         
@@ -357,3 +364,4 @@ def home():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
+
