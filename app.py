@@ -202,7 +202,7 @@ def webhook():
         
         photos = msg['photo']
         best_photo = photos[-1]['file_id']
-        current_date = datetime.now().strftime("%Y-%m-%d')
+        current_date = datetime.now().strftime("%Y-%m-%d" )
         
         # ✅ نعمل callback_data للزرار (لليوزر أو بدون يوزر)
         short_name = name[:8] if len(name) > 8 else name
